@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "shrimpbench"
+version = "1.0.0"
+description = "Zero-effort benchmarking utility with smart DataFrame validation and Rich CLI dashboard"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+dependencies = [
+    "pandas",
+    "numpy",
+    "line-profiler",
+    "rich",
+]
+
+[project.urls]
+Homepage = "https://github.com/UdaykiranEstari/shrimpbench"
