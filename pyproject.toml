@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "shrimpbench"
-version = "1.0.0"
+version = "2.0.0"
 description = "Zero-effort benchmarking utility with smart DataFrame validation and Rich CLI dashboard"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -16,5 +16,12 @@ dependencies = [
     "rich",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
 [project.urls]
 Homepage = "https://github.com/UdaykiranEstari/shrimpbench"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"

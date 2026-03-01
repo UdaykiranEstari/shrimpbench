@@ -2,12 +2,14 @@ import time
 import tracemalloc
 import inspect
 import ast
+import textwrap
 import warnings
 import os
 import json
+import getpass
 import statistics
-from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any
 
 import pandas as pd
 import numpy as np
@@ -25,6 +27,7 @@ from rich.rule import Rule
 @dataclass
 class BenchmarkResult:
     """Structured result returned by run_benchmark."""
+    old_output: Any = None
     new_output: Any = None
     old_time_stats: Any = None  # float or dict with min/mean/median/stddev
     new_time_stats: Any = None
@@ -32,28 +35,101 @@ class BenchmarkResult:
     new_memory_stats: Any = None
     speedup: float = 0.0
     valid: bool = True
-    mismatch_count: int = 0
+    mismatch_count: int = 0  # number of DataFrames in which mismatches were detected
 
 
 def _extract_return_names(func):
     """Try to extract variable names from a function's return tuple via AST."""
     try:
-        src = inspect.getsource(func)
+        src = textwrap.dedent(inspect.getsource(func))
         tree = ast.parse(src)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef):
-                for stmt in reversed(node.body):
-                    if isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Tuple):
-                        names = []
-                        for el in stmt.value.elts:
-                            if isinstance(el, ast.Name):
-                                names.append(el.id)
-                            else:
-                                names.append(None)
-                        return names
+        outer = next(
+            (n for n in tree.body
+             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))),
+            None,
+        )
+        if outer is None:
+            return None
+        for stmt in reversed(outer.body):
+            if isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Tuple):
+                names = []
+                for el in stmt.value.elts:
+                    if isinstance(el, ast.Name):
+                        names.append(el.id)
+                    else:
+                        names.append(None)
+                return names
     except (OSError, TypeError, SyntaxError):
         pass
     return None
+
+
+def _get_required_and_optional(func):
+    """Return (required_params, optional_params) sets for a callable."""
+    params = inspect.signature(func).parameters
+    required, optional = set(), set()
+    for name, p in params.items():
+        if p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
+            continue
+        if p.default is p.empty:
+            required.add(name)
+        else:
+            optional.add(name)
+    return required, optional
+
+
+def _compute_stats(values):
+    """Return a scalar float for 1 sample, or a min/mean/median/stddev dict for many."""
+    if len(values) == 1:
+        return values[0]
+    return {
+        "min": min(values),
+        "mean": statistics.mean(values),
+        "median": statistics.median(values),
+        "stddev": statistics.stdev(values),
+    }
+
+
+def _stat_median(stats):
+    """Extract the median from a stats scalar or dict."""
+    if isinstance(stats, dict):
+        return stats["median"]
+    return stats
+
+
+def _stat_mean(stats):
+    """Extract the mean from a stats scalar or dict."""
+    if isinstance(stats, dict):
+        return stats["mean"]
+    return stats
+
+
+def _stat_stddev(stats):
+    """Extract stddev from a stats scalar or dict (0.0 for single-sample scalars)."""
+    if isinstance(stats, dict):
+        return stats["stddev"]
+    return 0.0
+
+
+def _df_to_rich_table(df, title, title_color):
+    """Render the first 5 rows of a DataFrame as a Rich Table."""
+    preview = df.head(5)
+    tbl = Table(
+        title=f"[{title_color}]{title}[/] [grey53](First 5 Rows - Sorted)[/]",
+        box=box.SIMPLE_HEAVY,
+        border_style="grey53",
+        header_style="bold white",
+        show_lines=False,
+        padding=(0, 1),
+    )
+    for col_name in preview.columns:
+        tbl.add_column(
+            str(col_name),
+            justify="right" if pd.api.types.is_numeric_dtype(preview[col_name]) else "left",
+        )
+    for _, row in preview.iterrows():
+        tbl.add_row(*[str(v) for v in row.values])
+    return tbl
 
 
 def run_benchmark(func_old, func_new, scope,
@@ -63,14 +139,15 @@ def run_benchmark(func_old, func_new, scope,
                   rtol=0.01,
                   atol=1e-5,
                   profile_funcs=None,
-                  dump_mismatches=True,
+                  dump_mismatches=False,
                   show_output_heads=True,
-                  user_name="Uday",
+                  user_name=None,
                   iterations=1,
                   warmup_runs=1,
-                  output_dir=None,
+                  output_dir="benchmark_results",
                   history_file=None,
-                  verbose=True):
+                  verbose=True,
+                  console=None):
     """
     Zero-effort Benchmarking Utility with Tuple Support,
     Multi-DataFrame Row Alignment, File Profiling, Aligned Previews, and Rich CLI Dashboard.
@@ -93,45 +170,57 @@ def run_benchmark(func_old, func_new, scope,
         rtol (float): Relative tolerance for numeric comparison. Defaults to 0.01 (1%).
         atol (float): Absolute tolerance for numeric comparison. Defaults to 1e-5.
         profile_funcs (list[callable] | None): List of functions to attach to the line profiler.
-            Profiling runs only on the last iteration. Results are saved to a text file.
-        dump_mismatches (bool): If True, writes detailed mismatch reports (CSV + JSON) to
-            the output directory. Defaults to True.
+            A separate un-timed profiling pass runs after all timed iterations. Results are
+            saved to a text file in the output directory.
+        dump_mismatches (bool): If True, writes detailed mismatch reports (CSV) to
+            the output directory. Defaults to False.
         show_output_heads (bool): If True, displays aligned head previews of old vs new
             DataFrames side by side in the console. Defaults to True.
-        user_name (str): Name displayed in the CLI dashboard greeting. Defaults to "Uday".
+        user_name (str | None): Name displayed in the CLI dashboard greeting. Defaults to
+            the OS username (getpass.getuser()).
         iterations (int): Number of timed iterations to run per function (after warmup).
             When > 1, reports min/mean/median/stddev of timings. Defaults to 1.
         warmup_runs (int): Number of warmup executions (results discarded) before timed
             iterations begin. Helps stabilize JIT/caching effects. Defaults to 1.
         output_dir (str | None): Directory path for saving profiler output, mismatch reports,
-            and benchmark history. Created automatically if it doesn't exist.
+            and benchmark history. Created automatically when first needed. Defaults to
+            "benchmark_results".
         history_file (str | None): Path to a JSON file for appending benchmark results over
             time, enabling historical trend tracking.
         verbose (bool): If True, displays the full ASCII dashboard header with tips and
             metadata. Set to False for minimal output. Defaults to True.
+        console (Console | None): A Rich Console instance to use for all output. When None,
+            a default Console() is created. Pass a recording console to capture output.
 
     Returns:
         BenchmarkResult: A dataclass containing:
+            - old_output: The output from the baseline function.
             - new_output: The output from the optimized function.
             - old_time_stats / new_time_stats: Execution time (float or dict with min/mean/median/stddev).
             - old_memory_stats / new_memory_stats: Peak memory in MB (float or dict).
             - speedup (float): Ratio of old median time to new median time.
             - valid (bool): True if all DataFrame outputs passed validation.
-            - mismatch_count (int): Total number of value-level mismatches found.
+            - mismatch_count (int): Number of DataFrames in which mismatches were detected.
     """
     wall_clock_start = time.perf_counter()
 
-    console = Console()
-    theme_color = "#DE7356"
+    if user_name is None:
+        raw = getpass.getuser()
+        user_name = raw.replace(".", " ").replace("_", " ").replace("-", " ").title()
 
-    # --- Output directory setup ---
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
+    if console is None:
+        console = Console()
+
+    theme_color = "#DE7356"
 
     def _out_path(filename):
         if output_dir:
             return os.path.join(output_dir, filename)
         return filename
+
+    def _ensure_output_dir():
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
 
     # --- Unified Tag System ---
     TAG_INFO = f"[bold white on {theme_color}] INFO [/]"
@@ -192,18 +281,6 @@ def run_benchmark(func_old, func_new, scope,
         console.print()
 
     # --- 2. AUTO-DISCOVERY ENGINE ---
-    def _get_required_and_optional(func):
-        params = inspect.signature(func).parameters
-        required, optional = set(), set()
-        for name, p in params.items():
-            if p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
-                continue
-            if p.default is p.empty:
-                required.add(name)
-            else:
-                optional.add(name)
-        return required, optional
-
     req_old, opt_old = _get_required_and_optional(func_old)
     req_new, opt_new = _get_required_and_optional(func_new)
     all_required = req_old | req_new
@@ -226,8 +303,9 @@ def run_benchmark(func_old, func_new, scope,
     console.print(f"{TAG_INFO} [grey74]Auto-mapped variables: {', '.join(inputs.keys())}[/grey74]")
 
     # --- 3. PROFILER SETUP ---
-    lp = LineProfiler()
+    lp = None
     if profile_funcs:
+        lp = LineProfiler()
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
             for f in profile_funcs:
@@ -251,14 +329,7 @@ def run_benchmark(func_old, func_new, scope,
                 tracemalloc.start()
                 t0 = time.perf_counter()
 
-                if profile_funcs and i == num_iterations - 1:
-                    # Only profile on the last iteration
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore", UserWarning)
-                        lp_wrapper = lp(func)
-                    out = lp_wrapper(**inputs)
-                else:
-                    out = func(**inputs)
+                out = func(**inputs)
 
                 t1 = time.perf_counter()
                 _, peak = tracemalloc.get_traced_memory()
@@ -268,34 +339,15 @@ def run_benchmark(func_old, func_new, scope,
                 mem_results.append(peak / (1024**2))
                 final_output = out
 
+        # Un-timed profiling pass — kept separate so profiler overhead
+        # does not contaminate any timing sample.
+        if lp is not None:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                lp_wrapper = lp(func)
+            lp_wrapper(**inputs)
+
         return final_output, time_results, mem_results
-
-    def _compute_stats(values):
-        """Compute min/mean/median/stddev from a list of values."""
-        if len(values) == 1:
-            return values[0]
-        return {
-            "min": min(values),
-            "mean": statistics.mean(values),
-            "median": statistics.median(values),
-            "stddev": statistics.stdev(values) if len(values) > 1 else 0.0,
-        }
-
-    def _stat_median(stats):
-        """Extract median value from stats (float or dict)."""
-        if isinstance(stats, dict):
-            return stats["median"]
-        return stats
-
-    def _stat_mean(stats):
-        if isinstance(stats, dict):
-            return stats["mean"]
-        return stats
-
-    def _stat_stddev(stats):
-        if isinstance(stats, dict):
-            return stats["stddev"]
-        return 0.0
 
     # --- 4. EXECUTION ---
     console.print(f"{TAG_RUN} [grey74]Running {alias_old} version...[/grey74]")
@@ -389,22 +441,6 @@ def run_benchmark(func_old, func_new, scope,
             console.print(f"\n[bold white]{df_names[idx]}[/] [grey53]— {alias_old} vs {alias_new}[/]")
             console.print(Rule(style="grey53"))
 
-            def _df_to_rich_table(df, title, title_color):
-                preview = df.head(5)
-                tbl = Table(
-                    title=f"[{title_color}]{title}[/] [grey53](First 5 Rows - Sorted)[/]",
-                    box=box.SIMPLE_HEAVY,
-                    border_style="grey53",
-                    header_style="bold white",
-                    show_lines=False,
-                    padding=(0, 1),
-                )
-                for col_name in preview.columns:
-                    tbl.add_column(str(col_name), justify="right" if pd.api.types.is_numeric_dtype(preview[col_name]) else "left")
-                for _, row in preview.iterrows():
-                    tbl.add_row(*[str(v) for v in row.values])
-                return tbl
-
             if not o_df.empty:
                 console.print(_df_to_rich_table(o_df, f"▼ {alias_old}", theme_color))
             else:
@@ -431,6 +467,7 @@ def run_benchmark(func_old, func_new, scope,
             if col not in n_df.columns:
                 console.print(f"{TAG_FAIL} Column missing in optimized DataFrame: {col}")
                 overall_valid = False
+                mismatch_reports.append((idx, f"Column '{col}' missing in {alias_new}", pd.DataFrame(), pd.DataFrame()))
                 continue
 
             old_vals = o_df[col].values
@@ -516,22 +553,21 @@ def run_benchmark(func_old, func_new, scope,
 
     console.print(res_table)
 
-    # Profiler overhead footnote
-    if profile_funcs:
-        console.print("[grey53]  Note: Profiler was active — time/memory includes profiler overhead[/grey53]")
-
     # --- 7. RESULTS & LOGGING ---
     mismatch_count = len(mismatch_reports)
 
     # --- 8. EXPORT PROFILER TO FILE ---
-    if profile_funcs:
+    export_lines = []
+    if lp is not None:
+        _ensure_output_dir()
         prof_filename = _out_path("profile_results.txt")
         with open(prof_filename, "w") as f:
             lp.print_stats(stream=f)
+        export_lines.append(f"{TAG_OUT} [bold white]Profiler saved to:[/bold white] [cyan]{prof_filename}[/cyan]")
 
     # --- 9. EXPORT MISMATCH CSVs ---
-    export_lines = []
     if not overall_valid and dump_mismatches:
+        _ensure_output_dir()
         for idx, err_reason, old_err_df, new_err_df in mismatch_reports:
             safe_old = alias_old.replace(' ', '_')
             safe_new = alias_new.replace(' ', '_')
@@ -540,9 +576,6 @@ def run_benchmark(func_old, func_new, scope,
             old_err_df.to_csv(filename_old, index=False)
             new_err_df.to_csv(filename_new, index=False)
             export_lines.append(f"{TAG_OUT} [{theme_color}]Exported {err_reason} to '{filename_old}' & '{filename_new}'[/]")
-
-    if profile_funcs:
-        export_lines.append(f"{TAG_OUT} [bold white]Profiler saved to:[/bold white] [cyan]{prof_filename}[/cyan]")
 
     # --- 10. HISTORICAL TRACKING ---
     if history_file:
@@ -559,6 +592,7 @@ def run_benchmark(func_old, func_new, scope,
             "iterations": iterations,
         }
         history_path = _out_path(history_file) if output_dir else history_file
+        _ensure_output_dir()
         history = []
         if os.path.exists(history_path):
             try:
@@ -607,6 +641,7 @@ def run_benchmark(func_old, func_new, scope,
 
     # --- 12. RETURN STRUCTURED RESULT ---
     return BenchmarkResult(
+        old_output=old_out,
         new_output=new_out,
         old_time_stats=old_time_stats,
         new_time_stats=new_time_stats,

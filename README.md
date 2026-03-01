@@ -6,6 +6,8 @@
 [![PyPI](https://img.shields.io/pypi/v/shrimpbench)](https://pypi.org/project/shrimpbench/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 
+<img src="assets/Dashboard.png" alt="ShrimpBench CLI Dashboard" width="100%" />
+
 ---
 
 ## Why ShrimpBench?
